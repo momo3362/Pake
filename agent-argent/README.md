@@ -1,19 +1,23 @@
 # agent-argent
 
-Suivi de portefeuille Binance **en lecture seule**, avec des règles de money
-management explicites et des propositions de dimensionnement à valider à la main.
+Gestion de portefeuille Binance : suivi, règles de money management, petits
+allers-retours automatiques plafonnés, et validation manuelle au-delà du seuil.
 
-**Cet agent ne passe aucun ordre, jamais.** Ce n'est pas une politique, c'est une
-propriété du code : `agent_argent/binance.py` n'autorise que sept endpoints REST,
-tous en lecture, et refuse au démarrage une clé API qui porterait le droit de
-trader. Un futur ajout qui tenterait de passer un ordre échoue à la frontière du
-client plutôt que d'envoyer de l'argent.
+**Le bot ne peut pas sortir de fonds de Binance.** Ce n'est pas une politique,
+c'est une propriété du code : `withdraw`, `transfer`, `borrow`, `repay`, `redeem`
+et `sub-account` sont rejetés sur tout chemin d'API, quelle que soit la liste
+blanche, et l'agent refuse de démarrer contre une clé autorisant les retraits.
+Quoi que fasse la stratégie, l'argent reste sur le compte.
+
+Deux clients coexistent : `BinanceReadOnlyClient` (suivi seul, refuse une clé qui
+peut trader) et `BinanceTradingClient` (ordres spot, refuse une clé qui peut
+retirer).
 
 ## Ce qu'il fait
 
 | Commande | Effet |
 |---|---|
-| `verifier` | Contrôle la connexion, la validité de la clé, et **refuse de tourner si la clé peut trader ou retirer** |
+| `verifier` | Contrôle la connexion et les droits de la clé |
 | `bilan` | Portefeuille valorisé, répartition, variation, repli depuis le plus haut, audit des règles |
 | `signal SYMBOLE` | Dimensionne une position pour que toucher le stop coûte exactement le risque configuré |
 
@@ -71,12 +75,88 @@ doit apparaître dans le canal, dans un fichier versionné, ni dans un message.
 un envoi. Conformément à la règle 1 d'AMORCE, tout mail se dépose en **brouillon** :
 l'agent n'envoie rien de lui-même.
 
+## Mode automatique
+
+Petits allers-retours exécutés seuls, plafonnés ; tout ce qui dépasse le seuil
+part en notification et attend votre accord.
+
+```bash
+python3 -m agent_argent.cli auto            # simulation, aucun ordre envoyé
+python3 -m agent_argent.cli auto --reel     # ordres réels
+python3 -m agent_argent.cli attente         # demandes en attente de votre accord
+python3 -m agent_argent.cli valider a1b2c3d
+python3 -m agent_argent.cli refuser a1b2c3d
+```
+
+### Les deux verrous d'armement
+
+Le bot ne place un ordre réel que si **les trois** conditions sont réunies :
+
+1. `"armed": true` dans `autonomous.json`
+2. la variable d'environnement `AGENT_ARGENT_ARME` définie sur la machine
+3. le drapeau `--reel` sur la ligne de commande
+
+Le verrou 2 est volontairement hors du dépôt : un `"armed": true` commité par
+accident reste inerte.
+
+### Les plafonds (`autonomous.json`)
+
+| Clé | Défaut | Effet |
+|---|---|---|
+| `max_order` | 300 € | Dépense maximale d'un ordre automatique |
+| `max_per_asset` | 300 € | Exposition automatique maximale sur une crypto |
+| `max_total_auto` | 1500 € | Exposition automatique totale |
+| `daily_loss_limit` | 100 € | Perte sur 24 h glissantes → **arrêt** |
+| `max_trades_per_day` | 20 | Plafond d'ordres, contre l'emballement |
+| `max_open_positions` | 5 | Positions automatiques simultanées |
+| `whitelist` | 3 paires | **Rien n'est tradé hors de cette liste** |
+| `approval_threshold` | 300 € | Au-delà → notification, pas d'exécution |
+| `approval_ttl_minutes` | 30 | Une demande non traitée expire |
+
+Les plafonds sont exprimés en euros et convertis au taux courant, donc 300 €
+restent 300 € quoi que fasse le dollar. Ils sont **réévalués juste avant chaque
+ordre**, sur des soldes fraîchement lus — jamais sur du cache. Un ordre trop
+gros n'est pas rejeté : il est **réduit** pour tenir sous le plafond.
+
+Une validation que vous accordez n'est pas un chèque en blanc : elle expire au
+bout de 30 minutes, et l'exécution est annulée si le marché a bougé de plus de
+1 % depuis la demande.
+
+### Protection systématique
+
+Chaque entrée est immédiatement suivie d'un OCO (take-profit + stop-loss). Si
+l'OCO ne peut pas être placé, **la position est revendue au marché sur-le-champ**.
+Une position non protégée est traitée comme un incident, pas comme un état normal.
+
+### Planification
+
+```cron
+*/15 * * * * cd /chemin/agent-argent && python3 -m agent_argent.cli auto --reel >> logs/auto.log 2>&1
+0 8 * * *    cd /chemin/agent-argent && python3 -m agent_argent.cli bilan >> logs/bilan.log 2>&1
+```
+
+Notification : `--notifier "commande"` reçoit le message sur stdin. Une trace est
+écrite dans `state/notifications.log` **avant** l'envoi, pour qu'un canal en panne
+ne produise jamais une demande silencieuse.
+
+## Avant d'armer : ce que vous devez savoir
+
+La stratégie (`strategy.py`) est un filtre de retour à la moyenne lisible et
+auditable. Elle **n'a pas été backtestée sur vos données**, parce qu'il n'y en a
+pas encore. Ses paramètres sont mes estimations, pas des mesures.
+
+Faites tourner `auto` sans `--reel` pendant quelques semaines : le journal
+(`state/journal.json`) enregistre chaque signal et son prix. On calibrera ensuite
+sur du réel. Armer avant cette étape vous donne une machine disciplinée dont
+personne, moi compris, ne connaît l'espérance de gain.
+
 ## Ce qu'il ne fait pas
 
-- Aucune exécution d'ordre, aucun retrait, aucun transfert.
-- Aucune prédiction de prix. `signal` répond à « combien », jamais à « quoi » ni
-  « quand » : le choix de l'actif reste entièrement le vôtre.
-- Aucun backtest pour l'instant.
+- **Aucun retrait, aucun transfert, aucun emprunt.** Interdits en dur sur tout
+  chemin d'API, quelle que soit la liste blanche. Le bot peut acheter et vendre ;
+  il ne peut pas sortir un euro de Binance.
+- Aucun trading sur marge ou sur futures. Spot uniquement.
+- Aucun backtest intégré pour l'instant.
 
 ## Tests
 
@@ -84,5 +164,6 @@ l'agent n'envoie rien de lui-même.
 python3 -m unittest discover -s tests
 ```
 
-29 tests couvrent la garantie de lecture seule, la valorisation, l'audit des
-règles, le dimensionnement et la persistance de l'état.
+70 tests couvrent l'impossibilité de sortir des fonds, la valorisation, l'audit
+des règles, le dimensionnement, les plafonds du mode automatique, les deux
+verrous d'armement, les coupe-circuits et la file de validation.

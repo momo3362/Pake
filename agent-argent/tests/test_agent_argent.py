@@ -7,7 +7,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from agent_argent.binance import BinanceReadOnlyClient, ReadOnlyViolation
+from agent_argent.binance import (
+    BinanceReadOnlyClient,
+    BinanceTradingClient,
+    ReadOnlyViolation,
+)
 from agent_argent.config import ConfigError, RiskRules
 from agent_argent.portfolio import build_portfolio
 from agent_argent.risk import audit, average_true_range, propose, round_to_step, symbol_filters
@@ -31,12 +35,49 @@ class ReadOnlyGuarantee(unittest.TestCase):
             with self.assertRaises(ReadOnlyViolation):
                 client._get(path)
 
-    def test_allowlist_contains_no_mutating_endpoint(self):
-        from agent_argent.binance import FORBIDDEN_FRAGMENTS, READ_ONLY_ENDPOINTS
+    def test_no_allowlisted_endpoint_can_move_funds_off_binance(self):
+        from agent_argent.binance import (
+            FORBIDDEN_FRAGMENTS,
+            READ_ONLY_ENDPOINTS,
+            TRADING_ENDPOINTS,
+        )
 
-        for endpoint in READ_ONLY_ENDPOINTS:
+        for endpoint in READ_ONLY_ENDPOINTS | TRADING_ENDPOINTS:
             for fragment in FORBIDDEN_FRAGMENTS:
                 self.assertNotIn(fragment, endpoint.lower())
+
+    def test_read_only_client_refuses_to_post_orders(self):
+        client = BinanceReadOnlyClient("k", "s")
+        for path in ("/api/v3/order", "/api/v3/order/oco"):
+            with self.assertRaises(ReadOnlyViolation):
+                client._request("POST", path)
+
+
+class FundEgressIsImpossible(unittest.TestCase):
+    """The one property that must hold even if the strategy is completely wrong."""
+
+    def test_trading_client_cannot_reach_withdrawal_or_transfer(self):
+        client = BinanceTradingClient("k", "s")
+        for path in (
+            "/sapi/v1/capital/withdraw/apply",
+            "/sapi/v1/asset/transfer",
+            "/sapi/v1/margin/loan",
+            "/sapi/v1/lending/daily/redeem",
+            "/sapi/v1/sub-account/transfer/subToMaster",
+        ):
+            with self.assertRaises(ReadOnlyViolation):
+                client._request("POST", path)
+
+    def test_trading_client_may_reach_order_endpoints(self):
+        client = BinanceTradingClient("k", "s")
+        # _check_path is the boundary; reaching it without raising is the assertion.
+        client._check_path("/api/v3/order", "POST")
+        client._check_path("/api/v3/order/oco", "POST")
+        client._check_path("/api/v3/account", "GET")
+
+    def test_unknown_endpoint_is_refused_even_when_harmless(self):
+        with self.assertRaises(ReadOnlyViolation):
+            BinanceTradingClient("k", "s")._check_path("/api/v3/myAllocations", "GET")
 
 
 class Valuation(unittest.TestCase):

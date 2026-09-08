@@ -1,9 +1,17 @@
-"""Minimal signed Binance REST client, structurally incapable of trading.
+"""Signed Binance REST clients with a hard capability boundary.
 
-Design note: the safety property here is not "we chose not to call the order
-endpoints". It is that `_get` refuses any path outside READ_ONLY_ENDPOINTS and
-the transport only ever issues GET. A future edit that tries to place an order
-fails loudly at the client boundary instead of quietly sending money.
+Two clients live here:
+
+  BinanceReadOnlyClient  reaches only read endpoints, and refuses to start
+                         against a key that carries trading rights.
+  BinanceTradingClient   additionally reaches the spot order endpoints, and
+                         refuses to start against a key that can WITHDRAW.
+
+The withdrawal ban is the property that survives every other bug in this
+codebase: whatever the strategy does wrong, it cannot move funds off Binance.
+Paths are checked against a per-client allowlist AND against FORBIDDEN_FRAGMENTS,
+so an endpoint that takes money out stays unreachable even if someone later adds
+it to an allowlist by mistake.
 """
 
 from __future__ import annotations
@@ -31,9 +39,19 @@ READ_ONLY_ENDPOINTS = frozenset(
     }
 )
 
-# Substrings that must never appear in a requested path, as defence in depth
-# against an endpoint being added to the allowlist by mistake.
-FORBIDDEN_FRAGMENTS = ("order", "withdraw", "transfer", "borrow", "repay", "redeem")
+# Endpoints the trading client may additionally reach. All are spot order
+# operations; none of them can move funds off the exchange.
+TRADING_ENDPOINTS = frozenset(
+    {
+        "/api/v3/order",
+        "/api/v3/order/oco",
+        "/api/v3/openOrders",
+    }
+)
+
+# Substrings that must never appear in a requested path, whatever any allowlist
+# says. These are the operations that take money out of the account.
+FORBIDDEN_FRAGMENTS = ("withdraw", "transfer", "borrow", "repay", "redeem", "sub-account")
 
 
 class BinanceError(Exception):
@@ -64,18 +82,35 @@ class BinanceReadOnlyClient:
     def _sign(self, query: str) -> str:
         return hmac.new(self._api_secret, query.encode("utf-8"), hashlib.sha256).hexdigest()
 
-    def _get(self, path: str, params: dict | None = None, signed: bool = False):
-        if path not in READ_ONLY_ENDPOINTS:
-            raise ReadOnlyViolation(
-                f"Endpoint refuse: {path}. Cet agent est en lecture seule; "
-                f"endpoints autorises: {', '.join(sorted(READ_ONLY_ENDPOINTS))}."
-            )
+    # Capability boundary. Subclasses widen these; nothing else may.
+    allowed_endpoints: frozenset[str] = READ_ONLY_ENDPOINTS
+    allowed_methods: frozenset[str] = frozenset({"GET"})
+
+    def _check_path(self, path: str, method: str) -> None:
         lowered = path.lower()
         for fragment in FORBIDDEN_FRAGMENTS:
             if fragment in lowered:
                 raise ReadOnlyViolation(
-                    f"Endpoint refuse: {path} contient le fragment interdit '{fragment}'."
+                    f"Endpoint refuse: {path} contient le fragment interdit '{fragment}'. "
+                    "Aucun code de cet agent ne peut sortir de fonds de Binance."
                 )
+        if path not in self.allowed_endpoints:
+            raise ReadOnlyViolation(
+                f"Endpoint refuse: {path}. Autorises pour {type(self).__name__}: "
+                f"{', '.join(sorted(self.allowed_endpoints))}."
+            )
+        if method not in self.allowed_methods:
+            raise ReadOnlyViolation(
+                f"Methode refusee: {method} sur {path} pour {type(self).__name__}."
+            )
+
+    def _get(self, path: str, params: dict | None = None, signed: bool = False):
+        return self._request("GET", path, params, signed)
+
+    def _request(
+        self, method: str, path: str, params: dict | None = None, signed: bool = False
+    ):
+        self._check_path(path, method)
 
         query_params = dict(params or {})
         if signed:
@@ -87,10 +122,15 @@ class BinanceReadOnlyClient:
             query = f"{query}&signature={self._sign(query)}"
 
         url = f"{self._base_url}{path}"
-        if query:
-            url = f"{url}?{query}"
+        data = None
+        if method == "GET":
+            if query:
+                url = f"{url}?{query}"
+        else:
+            # Binance accepts signed parameters as a form body on write calls.
+            data = query.encode("utf-8")
 
-        request = urllib.request.Request(url, method="GET")
+        request = urllib.request.Request(url, data=data, method=method)
         request.add_header("X-MBX-APIKEY", self._api_key)
         request.add_header("User-Agent", "xr-agent-argent/0.1 (read-only)")
 
@@ -172,3 +212,99 @@ class BinanceReadOnlyClient:
                 "et 'Activer les retraits', puis restreignez l'acces aux IP de confiance."
             )
         return account
+
+
+class BinanceTradingClient(BinanceReadOnlyClient):
+    """Read endpoints plus spot orders. Cannot withdraw, transfer or borrow.
+
+    Placing an order is deliberately awkward to reach: callers go through
+    execution.py, which applies the hard caps first. Nothing in this class
+    enforces position sizing; that is not its job.
+    """
+
+    allowed_endpoints = READ_ONLY_ENDPOINTS | TRADING_ENDPOINTS
+    allowed_methods = frozenset({"GET", "POST", "DELETE"})
+
+    def assert_trading_key(self) -> dict:
+        """Refuse a key that can withdraw. Trading rights are expected here."""
+        account = self.account()
+        if account.get("canWithdraw"):
+            raise BinanceError(
+                "REFUS DE DEMARRER: la cle API autorise les RETRAITS. "
+                "Un bot ne doit jamais pouvoir sortir de fonds. "
+                "Binance > Gestion API > editez la cle, decochez 'Activer les retraits', "
+                "gardez 'Activer le Trading Spot & Margin', "
+                "et restreignez l'acces a l'IP du VPS."
+            )
+        if not account.get("canTrade"):
+            raise BinanceError(
+                "La cle API ne porte pas le droit de trading, requis en mode automatique. "
+                "Binance > Gestion API > cochez 'Activer le Trading Spot & Margin'."
+            )
+        return account
+
+    def market_buy(self, symbol: str, quote_amount: float, client_id: str) -> dict:
+        """Spend exactly `quote_amount` of the quote asset. Binance sizes the base."""
+        return self._request(
+            "POST",
+            "/api/v3/order",
+            {
+                "symbol": symbol,
+                "side": "BUY",
+                "type": "MARKET",
+                "quoteOrderQty": f"{quote_amount:.8f}".rstrip("0").rstrip("."),
+                "newClientOrderId": client_id,
+                "newOrderRespType": "FULL",
+            },
+            signed=True,
+        )
+
+    def market_sell(self, symbol: str, quantity: str, client_id: str) -> dict:
+        return self._request(
+            "POST",
+            "/api/v3/order",
+            {
+                "symbol": symbol,
+                "side": "SELL",
+                "type": "MARKET",
+                "quantity": quantity,
+                "newClientOrderId": client_id,
+                "newOrderRespType": "FULL",
+            },
+            signed=True,
+        )
+
+    def protective_oco_sell(
+        self,
+        symbol: str,
+        quantity: str,
+        take_profit: str,
+        stop_trigger: str,
+        stop_limit: str,
+        client_id: str,
+    ) -> dict:
+        """One-cancels-the-other exit: take profit above, stop loss below.
+
+        OCO matters here. Two independent orders could both fill on a wick and
+        leave a short position the spot account cannot hold.
+        """
+        return self._request(
+            "POST",
+            "/api/v3/order/oco",
+            {
+                "symbol": symbol,
+                "side": "SELL",
+                "quantity": quantity,
+                "price": take_profit,
+                "stopPrice": stop_trigger,
+                "stopLimitPrice": stop_limit,
+                "stopLimitTimeInForce": "GTC",
+                "listClientOrderId": client_id,
+            },
+            signed=True,
+        )
+
+    def open_orders(self, symbol: str | None = None) -> list[dict]:
+        return self._request(
+            "GET", "/api/v3/openOrders", {"symbol": symbol} if symbol else {}, signed=True
+        )

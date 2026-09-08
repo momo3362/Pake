@@ -12,11 +12,14 @@ import argparse
 import sys
 from pathlib import Path
 
-from .binance import BinanceError, BinanceReadOnlyClient
+from .approvals import ApprovalQueue, render_notification
+from .auto_config import AutoRules
+from .binance import BinanceError, BinanceReadOnlyClient, BinanceTradingClient
 from .config import ConfigError, Credentials, RiskRules, load_dotenv
 from .portfolio import build_portfolio
 from .report import render_balance, render_proposal
 from .risk import audit, average_true_range, propose, symbol_filters
+from .runner import run_pass
 from .state import State
 
 DEFAULT_ROOT = Path(__file__).resolve().parent.parent
@@ -53,6 +56,40 @@ def build_parser() -> argparse.ArgumentParser:
     signal.add_argument(
         "--intervalle", default="1d", help="intervalle des bougies pour l'ATR (defaut 1d)"
     )
+
+    auto = sub.add_parser(
+        "auto", help="une passe automatique: signaux, garde-fous, execution ou validation"
+    )
+    auto.add_argument(
+        "--reel",
+        action="store_true",
+        help="envoie de vrais ordres. Sans ce drapeau, tout est simule.",
+    )
+    auto.add_argument(
+        "--auto-regles",
+        type=Path,
+        default=DEFAULT_ROOT / "autonomous.json",
+        help="plafonds du mode automatique",
+    )
+    auto.add_argument(
+        "--notifier",
+        default=None,
+        help="commande shell recevant la notification sur stdin (ex. 'mail -s ... vous@ex.fr')",
+    )
+
+    pending = sub.add_parser("attente", help="liste les demandes de validation en cours")
+    pending.add_argument(
+        "--auto-regles", type=Path, default=DEFAULT_ROOT / "autonomous.json"
+    )
+
+    for name, helptext in (("valider", "autorise une demande"), ("refuser", "rejette une demande")):
+        decision = sub.add_parser(name, help=helptext)
+        decision.add_argument("identifiant", help="id court affiche par 'attente'")
+        decision.add_argument("--note", default=None, help="commentaire libre")
+        decision.add_argument(
+            "--auto-regles", type=Path, default=DEFAULT_ROOT / "autonomous.json"
+        )
+
     return parser
 
 
@@ -143,12 +180,74 @@ def command_signal(args) -> int:
     return 0 if proposal.actionable else 1
 
 
+def command_auto(args) -> int:
+    load_dotenv(args.env)
+    credentials = Credentials.from_env()
+    rules = RiskRules.load(args.regles)
+    auto = AutoRules.load(args.auto_regles)
+    client = BinanceTradingClient(credentials.api_key, credentials.api_secret)
+
+    report = run_pass(
+        client,
+        rules,
+        auto,
+        state_dir=args.etat.parent,
+        live=args.reel,
+        notify_command=args.notifier,
+    )
+    print(report.render())
+    return 0
+
+
+def command_attente(args) -> int:
+    auto = AutoRules.load(args.auto_regles)
+    rules = RiskRules.load(args.regles)
+    queue = ApprovalQueue(args.etat.parent / "validations.json", auto.approval_ttl_minutes)
+    queue.expire_stale()
+    queue.save()
+
+    pending = queue.pending()
+    if not pending:
+        print("Aucune demande en attente.")
+        return 0
+    print(f"{len(pending)} demande(s) en attente:\n")
+    for request in pending:
+        print(render_notification(request, rules.display_asset))
+        print()
+    return 0
+
+
+def command_decision(args, approve: bool) -> int:
+    auto = AutoRules.load(args.auto_regles)
+    queue = ApprovalQueue(args.etat.parent / "validations.json", auto.approval_ttl_minutes)
+    queue.expire_stale()
+    try:
+        request = queue.decide(args.identifiant, approve, args.note)
+    except (KeyError, ValueError) as exc:
+        print(f"Erreur: {exc}", file=sys.stderr)
+        return 2
+    queue.save()
+    verb = "validee" if approve else "refusee"
+    print(f"Demande {request.id} ({request.symbol}) {verb}.")
+    if approve:
+        print(
+            "Elle sera executee a la prochaine passe 'auto', et seulement si le "
+            f"marche n'a pas bouge de plus de 1% et si moins de "
+            f"{auto.approval_ttl_minutes} min se sont ecoulees."
+        )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     handlers = {
         "verifier": command_verifier,
         "bilan": command_bilan,
         "signal": command_signal,
+        "auto": command_auto,
+        "attente": command_attente,
+        "valider": lambda a: command_decision(a, approve=True),
+        "refuser": lambda a: command_decision(a, approve=False),
     }
     try:
         return handlers[args.commande](args)

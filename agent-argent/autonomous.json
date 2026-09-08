@@ -1,0 +1,20 @@
+{
+  "armed": false,
+
+  "max_order": 300.0,
+  "max_per_asset": 300.0,
+  "max_total_auto": 1500.0,
+
+  "daily_loss_limit": 100.0,
+  "max_trades_per_day": 20,
+  "max_open_positions": 5,
+
+  "whitelist": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+
+  "take_profit_pct": 0.015,
+  "stop_loss_pct": 0.010,
+  "max_hold_minutes": 240,
+
+  "approval_threshold": 300.0,
+  "approval_ttl_minutes": 30
+}
