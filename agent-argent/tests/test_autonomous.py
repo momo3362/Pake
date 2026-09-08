@@ -336,6 +336,78 @@ class KeyRightsChecks(unittest.TestCase):
             self.FakeClient(self.TRADING_KEY).assert_read_only_key()
 
 
+class CredentialDiagnostics(unittest.TestCase):
+    """The commonest setup failure deserves a message that names the actual fix."""
+
+    def setUp(self):
+        import os
+
+        self.dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.dir.name)
+        self._saved = {
+            name: os.environ.pop(name, None)
+            for name in ("BINANCE_API_KEY", "BINANCE_API_SECRET")
+        }
+
+    def tearDown(self):
+        import os
+
+        self.dir.cleanup()
+        for name, value in self._saved.items():
+            os.environ.pop(name, None)
+            if value is not None:
+                os.environ[name] = value
+
+    def test_missing_file_tells_you_to_create_it(self):
+        from agent_argent.config import Credentials
+
+        with self.assertRaises(ConfigError) as caught:
+            Credentials.from_env(self.root / ".env")
+        self.assertIn("Aucun fichier", str(caught.exception))
+        self.assertIn("cp", str(caught.exception))
+
+    def test_unfilled_copy_is_diagnosed_differently(self):
+        from agent_argent.config import Credentials, load_dotenv
+
+        env = self.root / ".env"
+        env.write_text("BINANCE_API_KEY=\nBINANCE_API_SECRET=\n", encoding="utf-8")
+        load_dotenv(env)
+        with self.assertRaises(ConfigError) as caught:
+            Credentials.from_env(env)
+        message = str(caught.exception)
+        self.assertIn("existe mais", message)
+        self.assertIn("sans le remplir", message)
+
+    def test_partially_filled_names_the_missing_one(self):
+        from agent_argent.config import Credentials, load_dotenv
+
+        env = self.root / ".env"
+        env.write_text("BINANCE_API_KEY=abc\nBINANCE_API_SECRET=\n", encoding="utf-8")
+        load_dotenv(env)
+        with self.assertRaises(ConfigError) as caught:
+            Credentials.from_env(env)
+        self.assertIn("BINANCE_API_SECRET", str(caught.exception))
+        self.assertNotIn("BINANCE_API_KEY n", str(caught.exception))
+
+    def test_filled_file_loads(self):
+        from agent_argent.config import Credentials, load_dotenv
+
+        env = self.root / ".env"
+        env.write_text("BINANCE_API_KEY=abc\nBINANCE_API_SECRET=def\n", encoding="utf-8")
+        load_dotenv(env)
+        credentials = Credentials.from_env(env)
+        self.assertEqual(credentials.api_key, "abc")
+        self.assertEqual(credentials.api_secret, "def")
+
+    def test_quoted_values_are_unwrapped(self):
+        from agent_argent.config import Credentials, load_dotenv
+
+        env = self.root / ".env"
+        env.write_text('BINANCE_API_KEY="abc"\nBINANCE_API_SECRET=\'def\'\n', encoding="utf-8")
+        load_dotenv(env)
+        self.assertEqual(Credentials.from_env(env).api_key, "abc")
+
+
 class PriceFormatting(unittest.TestCase):
     def test_tick_rounding_never_uses_scientific_notation(self):
         self.assertNotIn("e", round_to_tick(0.00001234, 0.00000001).lower())

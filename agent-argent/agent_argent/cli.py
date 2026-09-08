@@ -1,9 +1,12 @@
 """Command-line entry point.
 
 Subcommands:
-  verifier  preflight: reachability, key validity, and that the key cannot trade
+  verifier  preflight: reachability, key rights, and consistency with the config
   bilan     valued portfolio, rule audit, drawdown
   signal    position sizing proposal for one symbol (advice only)
+  auto      one autonomous pass; simulated unless --reel is given
+  attente   approval requests waiting on you
+  valider / refuser   decide on one request
 """
 
 from __future__ import annotations
@@ -28,8 +31,9 @@ DEFAULT_ROOT = Path(__file__).resolve().parent.parent
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent-argent",
-        description="Suivi de portefeuille Binance en lecture seule et regles de money management. "
-        "Ne passe jamais d'ordre.",
+        description="Gestion de portefeuille Binance: suivi, regles de money management, "
+        "et petits allers-retours automatiques plafonnes. "
+        "Ne peut jamais retirer ni transferer de fonds.",
     )
     parser.add_argument(
         "--env", type=Path, default=DEFAULT_ROOT / ".env", help="fichier de credentials"
@@ -100,7 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _client(args) -> BinanceReadOnlyClient:
     load_dotenv(args.env)
-    credentials = Credentials.from_env()
+    credentials = Credentials.from_env(args.env)
     return BinanceReadOnlyClient(credentials.api_key, credentials.api_secret)
 
 
@@ -229,7 +233,7 @@ def command_signal(args) -> int:
 
 def command_auto(args) -> int:
     load_dotenv(args.env)
-    credentials = Credentials.from_env()
+    credentials = Credentials.from_env(args.env)
     rules = RiskRules.load(args.regles)
     auto = AutoRules.load(args.auto_regles)
     client = BinanceTradingClient(credentials.api_key, credentials.api_secret)

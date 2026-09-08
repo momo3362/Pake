@@ -44,9 +44,14 @@ Aucune dépendance : bibliothèque standard Python 3.10+ uniquement.
 
 ```bash
 git clone <depot> && cd agent-argent
-cp .env.example .env      # puis renseignez les deux clés
+cp .env.example .env
+nano .env                 # ÉTAPE OBLIGATOIRE : collez vos deux clés
 python3 -m agent_argent.cli verifier
 ```
+
+L'étape `nano` n'est pas facultative : `cp` produit un fichier aux clés vides, et
+`verifier` échouera tant que vous ne les aurez pas collées. Le message d'erreur
+distingue les deux cas (fichier absent / fichier copié mais non rempli).
 
 ### Créer la clé API Binance
 

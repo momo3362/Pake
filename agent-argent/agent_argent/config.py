@@ -36,15 +36,43 @@ class Credentials:
     api_secret: str
 
     @classmethod
-    def from_env(cls) -> "Credentials":
+    def from_env(cls, env_path: Path | None = None) -> "Credentials":
+        """Read credentials, and say precisely which setup step is missing.
+
+        "Copied .env.example but never filled it in" is by far the most common
+        way this fails, and it deserves a different message from "no .env at
+        all": the remedy is not the same.
+        """
         key = os.environ.get("BINANCE_API_KEY", "").strip()
         secret = os.environ.get("BINANCE_API_SECRET", "").strip()
-        if not key or not secret:
+        if key and secret:
+            return cls(api_key=key, api_secret=secret)
+
+        missing = [
+            name
+            for name, value in (("BINANCE_API_KEY", key), ("BINANCE_API_SECRET", secret))
+            if not value
+        ]
+
+        if env_path is None or not env_path.exists():
+            location = env_path or Path(".env")
             raise ConfigError(
-                "BINANCE_API_KEY et BINANCE_API_SECRET sont absents. "
-                "Renseignez-les dans agent-argent/.env (jamais dans le depot)."
+                f"Aucun fichier {location} trouve.\n"
+                f"  1. cp {location.parent / '.env.example'} {location}\n"
+                f"  2. ouvrez {location} et collez vos deux cles Binance\n"
+                "  3. relancez cette commande"
             )
-        return cls(api_key=key, api_secret=secret)
+
+        verb = "n'ont pas de valeur" if len(missing) > 1 else "n'a pas de valeur"
+        raise ConfigError(
+            f"Le fichier {env_path} existe mais {' et '.join(missing)} {verb}.\n"
+            "  Vous avez probablement copie .env.example sans le remplir.\n"
+            f"  Ouvrez {env_path} et collez vos cles apres le signe '=', "
+            "sans guillemets ni espace:\n"
+            "    BINANCE_API_KEY=abc123...\n"
+            "    BINANCE_API_SECRET=def456...\n"
+            "  Ces cles ne doivent jamais etre commitees ni collees dans un message."
+        )
 
 
 @dataclass(frozen=True)
