@@ -17,7 +17,7 @@ retirer).
 
 | Commande | Effet |
 |---|---|
-| `verifier` | Contrôle la connexion et les droits de la clé |
+| `verifier` | Contrôle la connexion, les droits de la clé, et leur **cohérence avec votre configuration** |
 | `bilan` | Portefeuille valorisé, répartition, variation, repli depuis le plus haut, audit des règles |
 | `signal SYMBOLE` | Dimensionne une position pour que toucher le stop coûte exactement le risque configuré |
 

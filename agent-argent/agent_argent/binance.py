@@ -191,11 +191,27 @@ class BinanceReadOnlyClient:
 
     # -- preflight --------------------------------------------------------
 
-    def assert_read_only_key(self) -> dict:
-        """Fail fast if the configured key carries trading or withdrawal rights.
+    def assert_no_withdrawal(self) -> dict:
+        """The floor every mode enforces: the key must not be able to withdraw.
 
-        A key that *can* trade is a key that can lose money to a bug. We refuse
-        to run with one even though we would never call an order endpoint.
+        Monitoring and autonomous trading disagree about the trading right, but
+        neither ever needs to move funds off the exchange.
+        """
+        account = self.account()
+        if account.get("canWithdraw"):
+            raise BinanceError(
+                "REFUS DE DEMARRER: la cle API autorise les RETRAITS. "
+                "Binance > Gestion API > editez la cle et decochez "
+                "'Activer les retraits', puis restreignez l'acces a l'IP du VPS."
+            )
+        return account
+
+    def assert_read_only_key(self) -> dict:
+        """Stricter check for monitor-only deployments: no trading either.
+
+        Only call this when the operator has said they want a key that cannot
+        trade. In autonomous mode the trading right is required, so this check
+        would reject a correctly configured key.
         """
         account = self.account()
         dangerous = []

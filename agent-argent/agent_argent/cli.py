@@ -42,7 +42,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     sub = parser.add_subparsers(dest="commande", required=True)
-    sub.add_parser("verifier", help="controle la cle API et refuse une cle qui peut trader")
+    check = sub.add_parser(
+        "verifier", help="controle la cle, ses droits, et la coherence avec la config"
+    )
+    check.add_argument(
+        "--auto-regles", type=Path, default=DEFAULT_ROOT / "autonomous.json"
+    )
 
     balance = sub.add_parser("bilan", help="portefeuille valorise et audit des regles")
     balance.add_argument(
@@ -102,7 +107,8 @@ def _client(args) -> BinanceReadOnlyClient:
 def _load_context(args):
     rules = RiskRules.load(args.regles)
     client = _client(args)
-    account = client.assert_read_only_key()
+    # Monitoring works with either key shape. Only withdrawal is never allowed.
+    account = client.assert_no_withdrawal()
     prices = client.prices()
     portfolio, unpriced = build_portfolio(account.get("balances", []), prices, rules)
     return client, rules, portfolio, unpriced, prices
@@ -110,17 +116,58 @@ def _load_context(args):
 
 def command_verifier(args) -> int:
     rules = RiskRules.load(args.regles)
+    auto = AutoRules.load(getattr(args, "auto_regles", None) or DEFAULT_ROOT / "autonomous.json")
     client = _client(args)
     client.server_time()
-    account = client.assert_read_only_key()
+    account = client.assert_no_withdrawal()
+
+    can_trade = bool(account.get("canTrade"))
+    non_zero = sum(
+        1
+        for b in account.get("balances", [])
+        if float(b["free"]) + float(b["locked"]) > 0
+    )
+
     print("Connexion Binance : OK")
-    print("Droits de la cle  : lecture seule confirmee (trading et retrait desactives)")
     print(f"Type de compte    : {account.get('accountType', 'inconnu')}")
-    print(f"Soldes non nuls   : {sum(1 for b in account.get('balances', []) if float(b['free']) + float(b['locked']) > 0)}")
-    print(f"Regles chargees   : risque/idee {rules.risk_per_trade:.1%}, "
-          f"position max {rules.max_position_pct:.0%}, "
-          f"exposition max {rules.max_total_exposure_pct:.0%}, "
-          f"repli max {rules.max_drawdown_pct:.0%}")
+    print(f"Soldes non nuls   : {non_zero}")
+    print("Retrait           : DESACTIVE (verifie)")
+    print(f"Trading spot      : {'active' if can_trade else 'desactive'}")
+
+    armed, why_not = auto.is_armed()
+    print(
+        f"Mode automatique  : {'ARME' if armed else 'desarme'}"
+        + (f" ({why_not})" if not armed else "")
+    )
+
+    # Cross-check the key against the intended mode, and say what to fix.
+    if armed and not can_trade:
+        print(
+            "\nINCOHERENCE: le mode automatique est arme mais la cle ne peut pas trader.\n"
+            "  Binance > Gestion API > cochez 'Activer le Trading Spot & Margin'.",
+            file=sys.stderr,
+        )
+        return 2
+    if can_trade and not auto.armed:
+        print(
+            "\nNote: la cle peut trader alors que le mode automatique est desarme.\n"
+            "  C'est sans danger (rien ne passe d'ordre), mais si vous ne comptez\n"
+            "  faire que du suivi, retirez le droit de trading sur la cle."
+        )
+
+    print(
+        f"\nRegles de risque  : risque/idee {rules.risk_per_trade:.1%}, "
+        f"position max {rules.max_position_pct:.0%}, "
+        f"exposition max {rules.max_total_exposure_pct:.0%}, "
+        f"repli max {rules.max_drawdown_pct:.0%}"
+    )
+    print(
+        f"Plafonds auto     : {auto.max_order:.0f} {rules.display_asset}/ordre, "
+        f"{auto.max_per_asset:.0f}/crypto, {auto.max_total_auto:.0f} au total, "
+        f"coupe-circuit a -{auto.daily_loss_limit:.0f}"
+    )
+    print(f"Paires autorisees : {', '.join(auto.whitelist) or 'AUCUNE'}")
+    print(f"Seuil validation  : au-dessus de {auto.approval_threshold:.0f} {rules.display_asset}")
     return 0
 
 

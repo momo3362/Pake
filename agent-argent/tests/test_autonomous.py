@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent_argent.approvals import APPROVED, PENDING, ApprovalQueue
 from agent_argent.auto_config import AutoRules
+from agent_argent.binance import BinanceTradingClient
 from agent_argent.config import ConfigError
 from agent_argent.execution import format_quantity, round_to_tick
 from agent_argent.guards import Intent, evaluate
@@ -280,6 +281,59 @@ class Queue(unittest.TestCase):
         self.path.write_text("{casse", encoding="utf-8")
         with self.assertRaises(RuntimeError):
             ApprovalQueue(self.path, 30)
+
+
+class KeyRightsChecks(unittest.TestCase):
+    """A trading-enabled key must pass the checks that monitoring commands run.
+
+    Regression: bilan/signal/verifier used assert_read_only_key, which rejects
+    the very key autonomous mode requires. The whole documented setup sequence
+    failed on step one.
+    """
+
+    class FakeClient(BinanceTradingClient):
+        def __init__(self, account):
+            super().__init__("k", "s")
+            self._account = account
+
+        def account(self):
+            return self._account
+
+    TRADING_KEY = {"canTrade": True, "canWithdraw": False, "balances": []}
+    WITHDRAW_KEY = {"canTrade": True, "canWithdraw": True, "balances": []}
+    MONITOR_KEY = {"canTrade": False, "canWithdraw": False, "balances": []}
+
+    def test_trading_key_passes_the_no_withdrawal_floor(self):
+        client = self.FakeClient(self.TRADING_KEY)
+        self.assertEqual(client.assert_no_withdrawal(), self.TRADING_KEY)
+
+    def test_monitor_key_also_passes_the_floor(self):
+        client = self.FakeClient(self.MONITOR_KEY)
+        self.assertEqual(client.assert_no_withdrawal(), self.MONITOR_KEY)
+
+    def test_withdrawal_key_is_refused_by_the_floor(self):
+        from agent_argent.binance import BinanceError
+
+        with self.assertRaises(BinanceError):
+            self.FakeClient(self.WITHDRAW_KEY).assert_no_withdrawal()
+
+    def test_withdrawal_key_is_refused_for_trading(self):
+        from agent_argent.binance import BinanceError
+
+        with self.assertRaises(BinanceError):
+            self.FakeClient(self.WITHDRAW_KEY).assert_trading_key()
+
+    def test_autonomous_mode_requires_the_trading_right(self):
+        from agent_argent.binance import BinanceError
+
+        with self.assertRaises(BinanceError):
+            self.FakeClient(self.MONITOR_KEY).assert_trading_key()
+
+    def test_strict_read_only_check_still_rejects_a_trading_key(self):
+        from agent_argent.binance import BinanceError
+
+        with self.assertRaises(BinanceError):
+            self.FakeClient(self.TRADING_KEY).assert_read_only_key()
 
 
 class PriceFormatting(unittest.TestCase):
